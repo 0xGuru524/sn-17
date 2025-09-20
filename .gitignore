@@ -54,3 +54,5 @@ validation/benchmark/results/
 .ipynb_checkpoints
 quic/
 .pre-commit-config.yaml
+
+generation/models
