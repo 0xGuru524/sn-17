@@ -1,19 +1,33 @@
-from io import BytesIO
 
+import os
+# os.environ['ATTN_BACKEND'] = 'xformers'   # Can be 'flash-attn' or 'xformers', default is 'flash-attn'
+os.environ['SPCONV_ALGO'] = 'native'        # Can be 'native' or 'auto', default is 'auto'.
+                                            # 'auto' is faster but will do benchmarking at the beginning.
+                                            # Recommended to set to 'native' if run only once.
+from io import BytesIO
+import imageio
 from fastapi import FastAPI, Depends, Form
 from fastapi.responses import Response, StreamingResponse
 import uvicorn
 import argparse
 import base64
 from time import time
-
+import numpy as np
 from omegaconf import OmegaConf
 from loguru import logger
 
-from DreamGaussianLib import ModelsPreLoader
-from DreamGaussianLib.GaussianProcessor import GaussianProcessor
-from video_utils import VideoUtils
+from diffusers import FluxPipeline
+import torch
+# from huggingface_hub import hf_hub_download
 
+from trellis.pipelines import TrellisImageTo3DPipeline
+from trellis.utils import render_utils
+from para_attn.first_block_cache.diffusers_adapters import apply_cache_on_pipe
+
+MAX_SEED = np.iinfo(np.int32).max
+
+def get_seed(randomize_seed: bool, seed: int) -> int:
+    return np.random.randint(0, MAX_SEED) if randomize_seed else seed
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -21,24 +35,29 @@ def get_args():
     parser.add_argument("--config", default="configs/text_mv.yaml")
     return parser.parse_args()
 
-
 args = get_args()
 app = FastAPI()
-
 
 def get_config() -> OmegaConf:
     config = OmegaConf.load(args.config)
     return config
 
-
-# def get_models(config: OmegaConf = Depends(get_config)):
-#     return ModelsPreLoader.preload_model(config, "cuda")
-
-
 @app.on_event("startup")
 def startup_event() -> None:
     config = get_config()
-    app.state.models = ModelsPreLoader.preload_model(config, "cuda")
+    # initialize flux pipeline
+    flux_pipeline = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16)
+    # lora_path = hf_hub_download(repo_id="manbeast3b/FLUX.1-schnell-3dgen-lora", filename="3dgen.safetensors")
+    flux_pipeline.load_lora_weights("./3dgen-lora/weights/3dgen.safetensors")
+    flux_pipeline.cuda()
+    apply_cache_on_pipe(flux_pipeline, residual_diff_threshold=0.08)
+
+    # Initialize trellis pipeline
+    trellis_pipeline = TrellisImageTo3DPipeline.from_pretrained("JeffreyXiang/TRELLIS-image-large")
+    trellis_pipeline.cuda()
+
+    app.state.flux_pipeline = flux_pipeline
+    app.state.trellis_pipeline = trellis_pipeline
 
 
 @app.post("/generate/")
@@ -48,13 +67,33 @@ async def generate(
     #models: list = Depends(get_models),
 ) -> Response:
     t0 = time()
-    gaussian_processor = GaussianProcessor(opt, prompt)
-    gaussian_processor.train(app.state.models, opt.iters)
+    prompt = f"3dgen, {prompt}"
+    image = app.state.flux_pipeline(prompt, num_inference_steps=28, guidance_scale=3.5).images[0]
+    image.save("generated_image.jpg")
     t1 = time()
     logger.info(f" Generation took: {(t1 - t0) / 60.0} min")
 
+    seed = get_seed(True, 1)
+    outputs = app.state.trellis_pipeline.run(
+        image,
+        seed=seed,
+        formats=["gaussian", "mesh"],
+        preprocess_image=False,
+        sparse_structure_sampler_params={
+            "steps": 12,
+            "cfg_strength": 7.5,
+        },
+        slat_sampler_params={
+            "steps": 12,
+            "cfg_strength": 3,
+        },
+    )
+
+    video = render_utils.render_video(outputs['gaussian'][0])['color']
+    imageio.mimsave("sample_gs.mp4", video, fps=30)
+
     buffer = BytesIO()
-    gaussian_processor.get_gs_model().save_ply(buffer)
+    outputs['gaussian'][0].save_ply(buffer)
     buffer.seek(0)
     buffer = buffer.getbuffer()
     t2 = time()
@@ -70,26 +109,36 @@ async def generate_video(
     opt: OmegaConf = Depends(get_config),
     #models: list = Depends(get_models),
 ):
+    t0 = time()
+    prompt = f"3dgen, {prompt}"
+    image = app.state.flux_pipeline(prompt, num_inference_steps=28, guidance_scale=3.5).images[0]
+    image.save("generated_image.jpg")
     t1 = time()
-    gaussian_processor = GaussianProcessor(opt, prompt)
-    gaussian_processor.train(app.state.models, opt.iters)
-    processed_data = gaussian_processor.get_gs_data(return_rgb_colors=True)
+    logger.info(f" Generation took: {(t1 - t0) / 60.0} min")
 
-    logger.info(f" It took: {(time() - t1) / 60.0} min")
-    logger.info("Generating video.")
-
-    t2 = time()
-    video_utils = VideoUtils(video_res, video_res, 5, 5, 10, -30, 10)
-    buffer, _ = video_utils.render_video(
-        processed_data[0],
-        None,
-        processed_data[4],
-        None,
-        processed_data[3],
-        processed_data[2],
-        processed_data[1],
-        None
+    seed = get_seed(True, 1)
+    outputs = app.state.trellis_pipeline.run(
+        image,
+        seed=seed,
+        formats=["gaussian", "mesh"],
+        preprocess_image=False,
+        sparse_structure_sampler_params={
+            "steps": 12,
+            "cfg_strength": 7.5,
+        },
+        slat_sampler_params={
+            "steps": 12,
+            "cfg_strength": 3,
+        },
     )
+
+    video = render_utils.render_video(outputs['gaussian'][0])['color']
+    t2 = time()
+
+    buffer = BytesIO()
+    imageio.mimsave(buffer, video, fps=30)
+    buffer.seek(0)
+    buffer = buffer.getbuffer()
     logger.info(f" It took: {(time() - t2) / 60.0} min")
 
     return StreamingResponse(content=buffer, media_type="video/mp4")
