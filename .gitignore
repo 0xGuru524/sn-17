@@ -56,3 +56,4 @@ quic/
 .pre-commit-config.yaml
 
 generation/models
+generation/FluxTRELLIS
