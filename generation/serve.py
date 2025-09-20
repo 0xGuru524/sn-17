@@ -4,6 +4,9 @@ import os
 os.environ['SPCONV_ALGO'] = 'native'        # Can be 'native' or 'auto', default is 'auto'.
                                             # 'auto' is faster but will do benchmarking at the beginning.
                                             # Recommended to set to 'native' if run only once.
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)                                          
+
 from io import BytesIO
 import imageio
 from fastapi import FastAPI, Depends, Form
@@ -49,7 +52,6 @@ def startup_event() -> None:
     flux_pipeline = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16)
     # lora_path = hf_hub_download(repo_id="manbeast3b/FLUX.1-schnell-3dgen-lora", filename="3dgen.safetensors")
     flux_pipeline.load_lora_weights("./3dgen-lora/weights/3dgen.safetensors")
-    flux_pipeline.cuda()
     apply_cache_on_pipe(flux_pipeline, residual_diff_threshold=0.08)
 
     # Initialize trellis pipeline
